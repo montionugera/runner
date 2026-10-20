@@ -1540,6 +1540,8 @@ impl NativeRoot {
                 }
             }
             PaneNode::Split(split) => {
+                #[cfg(test)]
+                crate::render_counts::count_render(&format!("split:{}", split.id), cx);
                 let a = self.render_card_pane_node(
                     &split.a,
                     layout,

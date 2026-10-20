@@ -144,6 +144,7 @@ impl StoreRevisions {
     pub(crate) fn reactions_since(self, previous: Self) -> StoreReactions {
         let mut data_revisions = self;
         data_revisions.terminal_wake = previous.terminal_wake;
+        data_revisions.activity = previous.activity;
         let mut non_settings_revisions = data_revisions;
         non_settings_revisions.settings = previous.settings;
         non_settings_revisions.mission_settings = previous.mission_settings;

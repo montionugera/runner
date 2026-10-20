@@ -1,4 +1,4 @@
-.PHONY: build check fmt fmt-check clippy test test-nightly verify run clean cache-size guide-cli guide-cli-check
+.PHONY: build check fmt fmt-check clippy test test-nightly perf verify run clean cache-size guide-cli guide-cli-check
 
 # Crew builds hit load 208 on 2026-08-22 and starved the UI.
 CARGO_BUILD_JOBS ?= 12
@@ -25,6 +25,9 @@ test:
 
 test-nightly:
 	uv run --no-project --with pyyaml python script/test-nightly.py -v
+
+perf:
+	python3 script/perf.py
 
 guide-cli:
 	cargo build --locked -p runner-cli --profile ci

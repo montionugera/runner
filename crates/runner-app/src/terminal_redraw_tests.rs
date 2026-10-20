@@ -4,7 +4,7 @@ use std::time::Duration;
 use gpui::{px, size, TestAppContext, VisualTestContext};
 
 use crate::render_counts::RenderCounts;
-use crate::{AppRoute, NativeRoot, PaneLayout, SplitOrientation};
+use crate::{AppRoute, NativeRoot, PaneLayout, PaneNode, SplitOrientation};
 
 #[test]
 fn terminal_output_reuses_split_siblings_and_title_changes_update_sidebar() {
@@ -273,5 +273,448 @@ fn terminal_output_reuses_split_siblings_and_title_changes_update_sidebar() {
         rendered.get(&format!("pane:{idle_pane}")),
         None,
         "idle pane must stay cached beside a busy drawer: {rendered:?}"
+    );
+}
+
+#[test]
+fn sidebar_status_change_only_rerenders_affected_sidebar_views() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    let (node_id, idle_pane, _core, _terminal) = store.update(&mut cx, |store, cx| {
+        crate::app_store::seed_mixed_working_sessions(store);
+        for status in store.session_statuses.values_mut() {
+            status.observation.activity = runner_core::protocol::status::Activity::Idle;
+        }
+        let core = store.test_core.clone();
+        let events: Arc<dyn runner_daemon::session::manager::SessionEvents> =
+            Arc::new(core.session_events());
+        for id in ["busy-shell", "direct-agent"] {
+            core.sessions
+                .prepare_unlisted_terminal(id, (80, 24), &core.db, &events)
+                .unwrap();
+            store.bridge.attach(id).unwrap();
+        }
+        let mut layout = PaneLayout::single(Some("busy-shell"), &[]);
+        let idle_pane = layout.split("p1", SplitOrientation::Row).unwrap();
+        layout.assign_session(&idle_pane, "direct-agent").unwrap();
+        let conn = core.db.get().unwrap();
+        let node =
+            runner_daemon::repo::node::create_tab(&conn, None, "", 0, &layout.serialize().unwrap())
+                .unwrap();
+        store.replace_nodes(runner_daemon::repo::node::list(&conn).unwrap(), cx);
+        let terminal = store.bridge.session("busy-shell").unwrap();
+        (node.id, idle_pane, core, terminal)
+    });
+    let host = cx.add_window(|window, cx| {
+        let mut root = NativeRoot::new(
+            "status-change-test".into(),
+            temp.path().join("logs"),
+            None,
+            None,
+            store.clone(),
+            window,
+            cx,
+        );
+        root.apply_tab_rows(cx);
+        assert!(root.tabs.activate_session("direct-agent"));
+        root.route = AppRoute::Chat;
+        root.sync_active_chat_detail(cx);
+        root.ensure_active_tab_attached(window, cx).unwrap();
+        root
+    });
+    let _visual = VisualTestContext::from_window(host.into(), &cx);
+    _visual.simulate_resize(size(px(1440.), px(900.)));
+    cx.run_until_parked();
+
+    let counts = RenderCounts::default();
+    cx.update(|cx| cx.set_global(counts.clone()));
+    host.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    cx.run_until_parked();
+
+    // Clear render counts before status update.
+    counts.0.borrow_mut().clear();
+
+    // Update status in the store: direct-agent becomes Working.
+    store.update(&mut cx, |store, cx| {
+        if let Some(status) = store.session_statuses.get_mut("direct-agent") {
+            status.observation.activity = runner_core::protocol::status::Activity::Working;
+        }
+        store.revisions.activity = store.revisions.activity.wrapping_add(1);
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let rendered = counts.0.borrow().clone();
+    assert!(
+        rendered.get("sidebar").copied().unwrap_or_default() > 0,
+        "sidebar must re-render when a status changes: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .get(&format!("sidebar-row:{node_id}"))
+            .copied()
+            .unwrap_or_default()
+            > 0,
+        "affected sidebar row must re-render: {rendered:?}"
+    );
+
+    // Unchanged views must not re-render.
+    for key in [
+        "tab-bar",
+        "side-panel",
+        "pane:p1",
+        &format!("pane:{idle_pane}"),
+        "terminal:busy-shell",
+        "terminal:direct-agent",
+    ] {
+        assert_eq!(
+            rendered.get(key).copied().unwrap_or_default(),
+            0,
+            "unchanged view re-rendered on sidebar status change: {key}: {rendered:?}"
+        );
+    }
+}
+
+#[test]
+fn tab_switch_only_rerenders_new_tab_views() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    let (node1_id, node2_id, _core) = store.update(&mut cx, |store, cx| {
+        crate::app_store::seed_mixed_working_sessions(store);
+        let core = store.test_core.clone();
+        let events: Arc<dyn runner_daemon::session::manager::SessionEvents> =
+            Arc::new(core.session_events());
+        for id in ["busy-shell", "direct-agent"] {
+            core.sessions
+                .prepare_unlisted_terminal(id, (80, 24), &core.db, &events)
+                .unwrap();
+            store.bridge.attach(id).unwrap();
+        }
+        let layout1 = PaneLayout::single(Some("busy-shell"), &[]);
+        let layout2 = PaneLayout::single(Some("direct-agent"), &[]);
+        let conn = core.db.get().unwrap();
+        let node1 = runner_daemon::repo::node::create_tab(
+            &conn,
+            None,
+            "",
+            0,
+            &layout1.serialize().unwrap(),
+        )
+        .unwrap();
+        let node2 = runner_daemon::repo::node::create_tab(
+            &conn,
+            None,
+            "",
+            1,
+            &layout2.serialize().unwrap(),
+        )
+        .unwrap();
+        store.replace_nodes(runner_daemon::repo::node::list(&conn).unwrap(), cx);
+        (node1.id, node2.id, core)
+    });
+    let host = cx.add_window(|window, cx| {
+        let mut root = NativeRoot::new(
+            "tab-switch-test".into(),
+            temp.path().join("logs"),
+            None,
+            None,
+            store.clone(),
+            window,
+            cx,
+        );
+        root.apply_tab_rows(cx);
+        assert!(root.tabs.activate(&node1_id));
+        root.route = AppRoute::Chat;
+        root.sync_active_chat_detail(cx);
+        root.ensure_active_tab_attached(window, cx).unwrap();
+        root
+    });
+    let _visual = VisualTestContext::from_window(host.into(), &cx);
+    _visual.simulate_resize(size(px(1440.), px(900.)));
+    cx.run_until_parked();
+
+    let counts = RenderCounts::default();
+    cx.update(|cx| cx.set_global(counts.clone()));
+    host.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    cx.run_until_parked();
+
+    let initial = counts.0.borrow().clone();
+    assert!(
+        initial
+            .get("terminal:busy-shell")
+            .copied()
+            .unwrap_or_default()
+            > 0
+    );
+    assert_eq!(
+        initial
+            .get("terminal:direct-agent")
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "direct-agent terminal must not render before switch"
+    );
+
+    // Clear render counts before switching tabs
+    counts.0.borrow_mut().clear();
+
+    // Switch to Tab 2
+    host.update(&mut cx, |root, window, cx| {
+        root.activate_tab(&node2_id, window, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let rendered = counts.0.borrow().clone();
+    assert!(
+        rendered.get("tab-bar").copied().unwrap_or_default() > 0,
+        "tab-bar must re-render on tab switch: {rendered:?}"
+    );
+    assert!(
+        rendered.get("sidebar").copied().unwrap_or_default() > 0,
+        "sidebar must re-render on tab switch: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .get(&format!("sidebar-row:{node2_id}"))
+            .copied()
+            .unwrap_or_default()
+            > 0,
+        "newly active sidebar row must re-render: {rendered:?}"
+    );
+    assert!(
+        rendered
+            .get("terminal:direct-agent")
+            .copied()
+            .unwrap_or_default()
+            > 0,
+        "newly active tab terminal must render: {rendered:?}"
+    );
+
+    // Hidden views from Tab 1 must NOT re-render:
+    assert_eq!(
+        rendered
+            .get("terminal:busy-shell")
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "hidden tab terminal must not re-render: {rendered:?}"
+    );
+}
+
+#[test]
+fn frames_drawn_for_terminal_output_burst_at_most_one_per_frame() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    let (_node_id, terminal) = store.update(&mut cx, |store, cx| {
+        crate::app_store::seed_mixed_working_sessions(store);
+        let core = store.test_core.clone();
+        let events: Arc<dyn runner_daemon::session::manager::SessionEvents> =
+            Arc::new(core.session_events());
+        core.sessions
+            .prepare_unlisted_terminal("busy-shell", (80, 24), &core.db, &events)
+            .unwrap();
+        store.bridge.attach("busy-shell").unwrap();
+        let layout = PaneLayout::single(Some("busy-shell"), &[]);
+        let conn = core.db.get().unwrap();
+        let node =
+            runner_daemon::repo::node::create_tab(&conn, None, "", 0, &layout.serialize().unwrap())
+                .unwrap();
+        store.replace_nodes(runner_daemon::repo::node::list(&conn).unwrap(), cx);
+        let terminal = store.bridge.session("busy-shell").unwrap();
+        (node.id, terminal)
+    });
+    let host = cx.add_window(|window, cx| {
+        let mut root = NativeRoot::new(
+            "burst-test".into(),
+            temp.path().join("logs"),
+            None,
+            None,
+            store.clone(),
+            window,
+            cx,
+        );
+        root.apply_tab_rows(cx);
+        assert!(root.tabs.activate_session("busy-shell"));
+        root.route = AppRoute::Chat;
+        root.sync_active_chat_detail(cx);
+        root.ensure_active_tab_attached(window, cx).unwrap();
+        root
+    });
+    let _visual = VisualTestContext::from_window(host.into(), &cx);
+    _visual.simulate_resize(size(px(1440.), px(900.)));
+    terminal.test_feed(1, b"init");
+    cx.run_until_parked();
+
+    let counts = RenderCounts::default();
+    cx.update(|cx| cx.set_global(counts.clone()));
+    host.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    cx.run_until_parked();
+
+    // Clear render counts before burst.
+    counts.0.borrow_mut().clear();
+
+    // Feed a rapid burst of 50 chunks within a single frame interval.
+    for seq in 2..=51 {
+        terminal.test_feed(seq, b"\r[chunk]");
+    }
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(4));
+    cx.run_until_parked();
+
+    let rendered = counts.0.borrow().clone();
+    assert_eq!(
+        rendered.get("terminal:busy-shell"),
+        Some(&1),
+        "burst of 50 outputs must draw at most one frame: {rendered:?}"
+    );
+
+    // Advancing clock without new output must NOT draw extra frames.
+    counts.0.borrow_mut().clear();
+    cx.executor().advance_clock(Duration::from_millis(16));
+    cx.run_until_parked();
+    assert_eq!(
+        counts
+            .0
+            .borrow()
+            .get("terminal:busy-shell")
+            .copied()
+            .unwrap_or_default(),
+        0,
+        "idle tick must draw zero frames"
+    );
+}
+
+#[test]
+fn layout_work_for_fixed_window_stays_within_budget() {
+    let _theme = crate::theme_snapshot::ThemeGuard::new();
+    let temp = tempfile::tempdir().unwrap();
+    let mut cx = TestAppContext::single();
+    let store = crate::app_store::test_lifecycle_store(&mut cx, temp.path());
+    let (node1_id, node2_id, idle_pane, split_id) = store.update(&mut cx, |store, cx| {
+        crate::app_store::seed_mixed_working_sessions(store);
+        let core = store.test_core.clone();
+        let events: Arc<dyn runner_daemon::session::manager::SessionEvents> =
+            Arc::new(core.session_events());
+        for id in ["busy-shell", "direct-agent"] {
+            core.sessions
+                .prepare_unlisted_terminal(id, (80, 24), &core.db, &events)
+                .unwrap();
+            store.bridge.attach(id).unwrap();
+        }
+        let mut layout1 = PaneLayout::single(Some("busy-shell"), &[]);
+        let idle_pane = layout1.split("p1", SplitOrientation::Row).unwrap();
+        layout1.assign_session(&idle_pane, "direct-agent").unwrap();
+        let split_id = match &layout1.root {
+            PaneNode::Split(split) => split.id.clone(),
+            _ => panic!("expected split root"),
+        };
+        let layout2 = PaneLayout::single(Some("direct-agent"), &[]);
+        let conn = core.db.get().unwrap();
+        let node1 = runner_daemon::repo::node::create_tab(
+            &conn,
+            None,
+            "",
+            0,
+            &layout1.serialize().unwrap(),
+        )
+        .unwrap();
+        let node2 = runner_daemon::repo::node::create_tab(
+            &conn,
+            None,
+            "",
+            1,
+            &layout2.serialize().unwrap(),
+        )
+        .unwrap();
+        store.replace_nodes(runner_daemon::repo::node::list(&conn).unwrap(), cx);
+        (node1.id, node2.id, idle_pane, split_id)
+    });
+    let host = cx.add_window(|window, cx| {
+        let mut root = NativeRoot::new(
+            "budget-test".into(),
+            temp.path().join("logs"),
+            None,
+            None,
+            store.clone(),
+            window,
+            cx,
+        );
+        root.apply_tab_rows(cx);
+        assert!(root.tabs.activate(&node1_id));
+        root.route = AppRoute::Chat;
+        root.sync_active_chat_detail(cx);
+        root.ensure_active_tab_attached(window, cx).unwrap();
+        root
+    });
+    let _visual = VisualTestContext::from_window(host.into(), &cx);
+    _visual.simulate_resize(size(px(1440.), px(900.)));
+    cx.run_until_parked();
+
+    let counts = RenderCounts::default();
+    cx.update(|cx| cx.set_global(counts.clone()));
+
+    // Trigger a single layout and paint pass on the fixed window.
+    counts.0.borrow_mut().clear();
+    host.update(&mut cx, |_, _, cx| cx.notify()).unwrap();
+    cx.run_until_parked();
+
+    let rendered = counts.0.borrow().clone();
+
+    // 1. Sidebar rows budget: each row laid out at most once per pass.
+    let row1_count = rendered
+        .get(&format!("sidebar-row:{node1_id}"))
+        .copied()
+        .unwrap_or_default();
+    let row2_count = rendered
+        .get(&format!("sidebar-row:{node2_id}"))
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(
+        row1_count, 1,
+        "sidebar row 1 must lay out exactly once: {rendered:?}"
+    );
+    assert_eq!(
+        row2_count, 1,
+        "sidebar row 2 must lay out exactly once: {rendered:?}"
+    );
+
+    // 2. Panes budget: each visible pane laid out at most once per pass.
+    let p1_count = rendered.get("pane:p1").copied().unwrap_or_default();
+    let idle_count = rendered
+        .get(&format!("pane:{idle_pane}"))
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(
+        p1_count, 1,
+        "pane p1 must lay out exactly once: {rendered:?}"
+    );
+    assert_eq!(
+        idle_count, 1,
+        "idle pane must lay out exactly once: {rendered:?}"
+    );
+
+    // 3. Splits budget: each visible split laid out at most once per pass.
+    let split_count = rendered
+        .get(&format!("split:{split_id}"))
+        .copied()
+        .unwrap_or_default();
+    assert_eq!(
+        split_count, 1,
+        "split must lay out exactly once: {rendered:?}"
+    );
+
+    // 4. Total layout work for (sidebar rows, panes, splits) must not exceed budget of 5.
+    let total_layout_work = row1_count + row2_count + p1_count + idle_count + split_count;
+    const BUDGET: usize = 5;
+    assert!(
+        total_layout_work <= BUDGET,
+        "fixed window layout work {total_layout_work} exceeded budget {BUDGET}: {rendered:?}"
     );
 }
